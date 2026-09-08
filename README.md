@@ -1,36 +1,90 @@
-# AI Fact Checker
+# FactChecker v2 — On-Chain Claim Adjudication Protocol
 
-An Intelligent Contract on GenLayer that verifies factual claims using AI validator consensus.
+FactChecker v2 is an **Intelligent Contract** deployed on the [GenLayer](https://genlayer.com) network. It moves beyond simple "single-prompt" LLM wrappers by executing a multi-stage, evidence-based adjudication protocol directly within decentralized validator consensus.
 
-## How it works
+## 🌟 Key Features
 
-1. Anyone submits a **claim** + a **URL** with supporting evidence
-2. AI validators independently fetch the URL and read its content
-3. Validators reach consensus via `gl.eq_principle.prompt_comparative`
-4. The verdict (**TRUE** / **FALSE**) and AI reasoning are stored permanently on-chain
+* **Multi-Source Evidence Acquisition (`gl.nondet`)**: Automatically discovers and gathers claims from open search endpoints (DuckDuckGo, Crossref, GDELT) and independent web domains rather than relying on a single hardcoded URL.
+* **Source Authority Tiers & Freshness Decay**: Evaluates sources across predefined authority tiers (Tier A: WHO/SEC/UN, Tier B: Reuters/Nature, Tier C/D) and applies time-decay algorithms (`_freshness_weight`) to penalize outdated data.
+* **Anti-Cherry-Picking Controls**: Caps the maximum weight given to submitter-supplied URLs (`PARTY_SUPPLIED_CAP = 4000`) to guarantee that independent sources drive the verdict.
+* **Consensus via Equivalence Principle (`gl.eq_principle`)**: Validators independently render web pages, strip non-relevant layout/JS blocks, run focused LLM stance analysis (`SUPPORTS` / `REFUTES`), and reach agreement on non-deterministic web data.
+* **Economic Challenge & Resolution Lifecycle**: Implements a bond-backed state machine (`PENDING` → `DISCOVERING` → `GATHERING` → `PROVISIONAL` → `CHALLENGED` → `FINAL`) with financial incentives (submission bonds, submitter rewards, and challenger stake redistribution).
 
-## Contract methods
+---
+
+## 🔄 Protocol Lifecycle
+
+[submit_claim] ──> PENDING
+│
+[start_verification]
+│
+▼
+┌──────────── DISCOVERING ◄──────────┐
+│         (discover_next loop)       │
+└──────────────────┬─────────────────┘
+│ [begin_reading]
+▼
+┌───────────── GATHERING ◄───────────┐
+│        (read_next_source loop)     │
+└──────────────────┬─────────────────┘
+│ [finish_verification]
+▼
+PROVISIONAL ──(Challenge Window: 7 Days)
+│
+┌───────────┴───────────┐
+│                       │
+[challenge]               [finalize]
+│                       │
+▼                       ▼
+CHALLENGED                 FINAL
+│ (resolution loop)
+▼
+[finish_resolution]
+│
+▼
+FINAL
+
+
+---
+
+## 📜 Contract Architecture
+
+### Core Methods
 
 | Method | Type | Description |
-|--------|------|-------------|
-| `submit_claim(claim, url)` | Write | Submit a claim with evidence URL |
-| `verify_claim(claim_id)` | Write | Trigger AI consensus verification |
-| `get_claim(claim_id)` | Read | Get a single claim result |
-| `get_all_claims()` | Read | Get all claims |
-| `total_claims()` | Read | Total number of claims |
+| :--- | :--- | :--- |
+| `submit_claim(claim, url)` | `write` | Submits a new claim and locks a `SUBMISSION_BOND` (100 credits). |
+| `start_verification(claim_id)` | `write` | Initializes the web discovery pipeline for the claim. |
+| `discover_next(claim_id)` | `write` | Fetches evidence links using `gl.nondet` across search endpoints. |
+| `begin_reading(claim_id)` | `write` | Filters and selects top independent domains across authority tiers. |
+| `read_next_source(claim_id)` | `write` | Renders the page, extracts context around claim keywords, and uses LLM to derive stance (`SUPPORTS`/`REFUTES`). |
+| `finish_verification(claim_id)` | `write` | Calculates weighted consensus margin and sets provisional verdict. |
+| `challenge(claim_id, counter_url, argument)` | `write` | Locks `CHALLENGE_BOND` (250 credits) to contest a provisional verdict with new evidence. |
+| `finish_resolution(claim_id)` | `write` | Re-adjudicates the claim; rewards challenger if verdict changes, or submitter if upheld. |
+| `finalize(claim_id)` | `write` | Confirms the provisional verdict after the challenge window closes. |
 
-## GenLayer features used
+---
 
-- `gl.nondet.web.render` — fetches live web content
-- `gl.nondet.exec_prompt` — queries LLM for verdict
-- `gl.eq_principle.prompt_comparative` — reaches validator consensus
+## 🛠️ Deployment & Testing
 
-## Deployed contract
+### Deploying on GenLayer Studio
 
-**Network:** Bradbury Testnet  
-**Address:** `0x90...0723`
+1. Open [GenLayer Studio](https://studio.genlayer.com/).
+2. Create a new contract file `FactChecker.py` and paste the source code.
+3. Deploy the contract.
 
-## Tech stack
+### Running Automated Walkthrough
 
-- Python Intelligent Contract (GenLayer)
-- GenLayer Bradbury Testnet
+To verify the contract using python test tools or GenLayer CLI:
+
+```bash
+# Run tests via GenLayer SDK/CLI
+genlayer test
+🛡️ Authority Tiers Reference
+Tier A (Weight: 10,000): Primary official organizations (who.int, sec.gov, un.org, nasa.gov, cdc.gov).
+
+Tier B (Weight: 7,000): Established wire services & academic journals (reuters.com, apnews.com, nature.com, bbc.com).
+
+Tier C (Weight: 4,000): Major global news outlets (nytimes.com, ft.com, bloomberg.com, theguardian.com).
+
+Tier D (Weight: 1,500): Unverified or general web sources.
