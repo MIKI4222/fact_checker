@@ -2,276 +2,294 @@
 import json
 from genlayer import *
 
-
 class FactChecker(gl.Contract):
     claims: DynArray[str]
 
     def __init__(self):
         pass
 
-    # ==================== HELPERS ====================
+    def _domain(self, url: str) -> str:
+        c = url.replace("https://", "").replace("http://", "").replace("www.", "")
+        return c.split("/")[0].lower()
 
-    def _get_domain(self, url: str) -> str:
-        clean = url.replace("https://", "").replace("http://", "").replace("www.", "")
-        return clean.split("/")[0].lower()
-
-    def _get_tier(self, domain: str) -> str:
-        if domain in ["who.int", "sec.gov", "un.org", "nasa.gov", "cdc.gov"]:
+    def _tier(self, d: str) -> str:
+        if d in ["who.int", "sec.gov", "un.org", "nasa.gov", "cdc.gov"]:
             return "A"
-        elif domain in ["reuters.com", "apnews.com", "nature.com", "bbc.com", "bbc.co.uk"]:
+        if d in ["reuters.com", "apnews.com", "nature.com", "bbc.com"]:
             return "B"
-        elif domain in ["nytimes.com", "ft.com", "bloomberg.com", "theguardian.com"]:
+        if d in ["nytimes.com", "ft.com", "bloomberg.com", "theguardian.com"]:
             return "C"
         return "D"
 
-    # ==================== PUBLIC WRITE METHODS ====================
+    def _weight(self, tier: str, stance: str, party: bool) -> int:
+        if stance == "INSUFFICIENT":
+            return 0
+        w = 1500
+        if tier == "A":
+            w = 13000
+        elif tier == "B":
+            w = 7000
+        elif tier == "C":
+            w = 4000
+        if party and w > 4000:
+            w = 4000
+        return w
+
+    def _keywords(self, claim: str) -> list:
+        stop = ["the", "and", "for", "was", "were", "are", "has", "have",
+                "had", "that", "this", "with", "from", "its"]
+        words = []
+        for raw in claim.lower().split():
+            w = ""
+            for ch in raw:
+                if ch.isalnum():
+                    w = w + ch
+            if len(w) < 3:
+                continue
+            if w in stop:
+                continue
+            if w not in words:
+                words.append(w)
+        return words
 
     @gl.public.write
     def submit_claim(self, claim: str, url: str) -> int:
-        claim_id = len(self.claims)
-        party_urls = []
-        selected = []
-
+        cid = len(self.claims)
+        sel = []
         if len(url.strip()) > 0:
-            clean_url = url.strip()
-            domain = self._get_domain(clean_url)
-            party_urls.append(clean_url)
-            selected.append({
-                "url": clean_url,
-                "domain": domain,
-                "tier": self._get_tier(domain),
-                "party": True
-            })
-
-        endpoints = [
-            f"https://lite.duckduckgo.com/lite/?q={claim.replace(' ', '+')}",
-            f"https://api.crossref.org/works?rows=20&select=URL,title&query={claim.replace(' ', '+')}"
-        ]
-
-        claim_record = {
-            "id": claim_id,
+            u = url.strip()
+            d = self._domain(u)
+            sel.append({"url": u, "domain": d, "tier": self._tier(d), "party": True})
+        rec = {
+            "id": cid,
             "claim": claim,
             "submitter": str(gl.message.sender_address),
             "status": "PENDING",
             "verdict": "",
             "confidence": 0,
-            "endpoints": endpoints,
-            "endpoint_cursor": 0,
-            "discovered": [],
-            "selected": selected,
+            "selected": sel,
             "cursor": 0,
+            "pending": {},
             "evidence": []
         }
+        self.claims.append(json.dumps(rec, sort_keys=True))
+        return cid
 
-        self.claims.append(json.dumps(claim_record, sort_keys=True))
-        return claim_id
+    @gl.public.write
+    def add_source(self, claim_id: int, url: str) -> str:
+        c = json.loads(self.claims[claim_id])
+        u = url.strip()
+        for item in c["selected"]:
+            if item["url"] == u:
+                return "DUPLICATE"
+        if len(c["selected"]) >= 5:
+            return "QUEUE_FULL"
+        d = self._domain(u)
+        c["selected"].append({"url": u, "domain": d, "tier": self._tier(d), "party": False})
+        self.claims[claim_id] = json.dumps(c, sort_keys=True)
+        return "ADDED"
 
     @gl.public.write
     def start_verification(self, claim_id: int) -> str:
         c = json.loads(self.claims[claim_id])
         if c["status"] != "PENDING":
             return "ALREADY_STARTED"
-        c["status"] = "DISCOVERING"
-        self.claims[claim_id] = json.dumps(c, sort_keys=True)
-        return "DISCOVERING"
-
-    @gl.public.write
-    def discover_next(self, claim_id: int) -> str:
-        """Collects evidence URLs with CANONICAL VALIDATOR AGREEMENT on the URL list."""
-        c = json.loads(self.claims[claim_id])
-        if c["status"] != "DISCOVERING":
-            return "ERROR_NOT_DISCOVERING"
-
-        if c["endpoint_cursor"] >= len(c["endpoints"]):
-            c["status"] = "GATHERING"
-            self.claims[claim_id] = json.dumps(c, sort_keys=True)
-            return "GATHERING"
-
-        ep = c["endpoints"][c["endpoint_cursor"]]
-        c["endpoint_cursor"] += 1
-
-        def fetch_canonical_urls() -> str:
-            discovered_urls = []
-            try:
-                rendered = gl.nondet.web.render(ep, mode="text")
-                if rendered and len(rendered) > 50:
-                    for token in rendered.split('"'):
-                        if token.startswith("http://") or token.startswith("https://"):
-                            if "duckduckgo" not in token and "crossref" not in token:
-                                discovered_urls.append(token.split('#')[0])
-            except Exception:
-                pass
-
-            # CANONICAL BINDING: Sort alphabetically and return top 5 as deterministic JSON
-            unique_sorted = sorted(list(set(discovered_urls)))[:5]
-            return json.dumps(unique_sorted, sort_keys=True)
-
-        # Consensus enforces 100% agreement on the exact list of discovered URLs
-        consensus_urls_str = gl.eq_principle.prompt_comparative(
-            fetch_canonical_urls,
-            principle="The array of discovered URLs must be exactly identical in content and order."
-        )
-
-        canonical_urls = json.loads(consensus_urls_str)
-        for u in canonical_urls:
-            if u not in c["discovered"]:
-                c["discovered"].append(u)
-
-        if c["endpoint_cursor"] >= len(c["endpoints"]):
-            c["status"] = "GATHERING"
-
-        self.claims[claim_id] = json.dumps(c, sort_keys=True)
-        return "OK"
-
-    @gl.public.write
-    def begin_reading(self, claim_id: int) -> str:
-        """Selects top canonical candidate URLs into reading queue."""
-        c = json.loads(self.claims[claim_id])
         c["status"] = "GATHERING"
-
-        all_candidates = sorted(list(set(c["discovered"])))
-        existing_urls = {item["url"] for item in c["selected"]}
-
-        for url in all_candidates:
-            if url not in existing_urls:
-                domain = self._get_domain(url)
-                c["selected"].append({
-                    "url": url,
-                    "domain": domain,
-                    "tier": self._get_tier(domain),
-                    "party": False
-                })
-                existing_urls.add(url)
-                if len(c["selected"]) >= 5:
-                    break
-
         self.claims[claim_id] = json.dumps(c, sort_keys=True)
         return "GATHERING"
 
     @gl.public.write
-    def read_next_source(self, claim_id: int) -> str:
-        """Reads source and enforces CONFLICT-FREE CONSENSUS on ALL weight-affecting fields."""
+    def fetch_next_source(self, claim_id: int) -> str:
         c = json.loads(self.claims[claim_id])
+        if len(c["pending"]) > 0:
+            return "PENDING_NOT_JUDGED"
         if c["cursor"] >= len(c["selected"]):
             return "COMPLETED"
 
-        target = c["selected"][c["cursor"]]
-        c["cursor"] += 1
-        url = target["url"]
+        t = c["selected"][c["cursor"]]
+        url = t["url"]
+        keywords = self._keywords(c["claim"])
 
-        page_text = ""
-        try:
-            page_text = gl.nondet.web.render(url, mode="text")
-            if page_text and len(page_text) > 2000:
-                page_text = page_text[:2000]
-        except Exception:
-            page_text = "FAILED_TO_LOAD"
-
-        prompt = (
-            "Analyze if the webpage content SUPPORTS, REFUTES, or is INSUFFICIENT to verify the claim.\n"
-            f"Claim: \"{c['claim']}\"\n"
-            f"Source Content: \"{page_text}\"\n\n"
-            "Reply strictly with JSON only: "
-            "{\"stance\": \"SUPPORTS\"|\"REFUTES\"|\"INSUFFICIENT\", \"is_primary\": true|false, \"specificity\": 1|2|3}"
-        )
-
-        def eval_source() -> str:
-            res = gl.nondet.exec_prompt(prompt)
-            res = res.replace("```json", "").replace("```", "").strip()
-
-            stance = "INSUFFICIENT"
-            is_primary = False
-            specificity = 1
+        def fetch_page() -> str:
             try:
-                parsed = json.loads(res)
-                stance = str(parsed.get("stance", "INSUFFICIENT"))
-                is_primary = bool(parsed.get("is_primary", False))
-                specificity = int(parsed.get("specificity", 1))
+                res = gl.nondet.web.request(url, method="GET")
+                body = res.body
+                if isinstance(body, bytes):
+                    body = body.decode("utf-8", errors="ignore")
+                raw = str(body)[:120000]
             except Exception:
-                pass
+                return "FAILED_TO_LOAD"
 
-            # Calculate deterministic weight inside validator thread
-            tier_weights = {"A": 10000, "B": 7000, "C": 4000, "D": 1500}
-            base_weight = tier_weights.get(target["tier"], 1500)
-            primary_mult = 1.3 if is_primary else 1.0
-            specificity_mult = 0.5 + (specificity * 0.25)
+            if len(raw) < 30:
+                return "FAILED_TO_LOAD"
 
-            raw_weight = int(base_weight * primary_mult * specificity_mult)
-            if target["party"]:
-                raw_weight = min(raw_weight, 4000)
-            if stance == "INSUFFICIENT":
-                raw_weight = 0
+            for tag in ["script", "style"]:
+                close = "</" + tag + ">"
+                parts = raw.split("<" + tag)
+                kept = parts[0]
+                for i in range(1, len(parts)):
+                    if close in parts[i]:
+                        kept = kept + " " + parts[i].split(close, 1)[1]
+                raw = kept
 
-            # FULL BINDING: The return JSON explicitly seals stance, primary status, specificity AND final weight
-            return json.dumps({
-                "stance": stance,
-                "is_primary": is_primary,
-                "specificity": specificity,
-                "weight": raw_weight
-            }, sort_keys=True)
+            low = raw.lower()
+            start = -1
+            for anchor in ["<h1", "<article", "<main"]:
+                pos = low.find(anchor)
+                if pos >= 0:
+                    start = pos
+                    break
+            if start > 0:
+                raw = raw[start:]
 
-        # STRICT CONSENSUS RULE: Binds all weight-affecting fields together
-        consensus_payload = gl.eq_principle.prompt_comparative(
-            eval_source,
-            principle="The stance, is_primary, specificity, and weight values in the JSON output MUST be EXACTLY identical."
+            pieces = []
+            for seg in raw.split("<"):
+                if ">" in seg:
+                    piece = seg.split(">", 1)[1]
+                else:
+                    piece = seg
+                for pair in [["&nbsp;", " "], ["&#160;", " "], ["&ndash;", "-"],
+                             ["&mdash;", "-"], ["&amp;", "&"]]:
+                    while pair[0] in piece:
+                        piece = piece.replace(pair[0], pair[1])
+                piece = " ".join(piece.split())
+                if len(piece) > 0:
+                    pieces.append(piece)
+
+            text = " ".join(pieces)
+            text = " ".join(text.split())
+            if len(text) < 30:
+                return "FAILED_TO_LOAD"
+
+            if len(text) <= 2000:
+                return text
+
+            low_text = text.lower()
+            best_start = 0
+            best_score = -1
+            i = 0
+            while i < len(text):
+                window = low_text[i:i + 1800]
+                score = 0
+                for word in keywords:
+                    score = score + window.count(word)
+                if score > best_score:
+                    best_score = score
+                    best_start = i
+                i = i + 600
+
+            excerpt = text[best_start:best_start + 1800]
+            if best_start > 0:
+                excerpt = text[:180] + " ... " + excerpt
+            return excerpt[:2000]
+
+        excerpt = gl.eq_principle.prompt_comparative(
+            fetch_page,
+            principle="Both texts are excerpts of the same web page and are equivalent if they discuss the same subject matter. Differences in wording or length are acceptable. A failure marker is only equivalent to another failure marker."
         )
 
-        eval_res = json.loads(consensus_payload)
-
-        evidence_entry = {
+        c["cursor"] += 1
+        c["pending"] = {
             "url": url,
-            "domain": target["domain"],
-            "tier": target["tier"],
-            "party_supplied": target["party"],
-            "stance": eval_res.get("stance", "INSUFFICIENT"),
-            "is_primary": eval_res.get("is_primary", False),
-            "specificity": eval_res.get("specificity", 1),
-            "weight": eval_res.get("weight", 0)
+            "domain": t["domain"],
+            "tier": t["tier"],
+            "party": t["party"],
+            "text": excerpt
         }
-
-        c["evidence"].append(evidence_entry)
         self.claims[claim_id] = json.dumps(c, sort_keys=True)
-        return "OK"
+        return "FETCHED"
+
+    @gl.public.write
+    def judge_pending_source(self, claim_id: int) -> str:
+        c = json.loads(self.claims[claim_id])
+        p = c["pending"]
+        if len(p) == 0:
+            return "NOTHING_PENDING"
+
+        claim_text = c["claim"]
+        page_text = p["text"]
+
+        def eval_stance() -> str:
+            prompt = (
+                "You verify a factual claim against the content of a web page. "
+                "The content may include website navigation text, which you ignore.\n\n"
+                "Claim: " + claim_text + "\n\n"
+                "Content: " + page_text + "\n\n"
+                "Answer with EXACTLY ONE word: SUPPORTS if the content confirms "
+                "the claim, REFUTES if it contradicts the claim, INSUFFICIENT "
+                "if the content does not mention the subject of the claim."
+            )
+            a = gl.nondet.exec_prompt(prompt).strip().upper()
+            if "REFUT" in a:
+                return "REFUTES"
+            if "SUPPORT" in a:
+                return "SUPPORTS"
+            return "INSUFFICIENT"
+
+        stance = gl.eq_principle.prompt_comparative(
+            eval_stance,
+            principle="Both outputs must be the same single verdict word."
+        ).strip().upper()
+
+        if stance != "SUPPORTS" and stance != "REFUTES":
+            stance = "INSUFFICIENT"
+
+        c["evidence"].append({
+            "url": p["url"],
+            "domain": p["domain"],
+            "tier": p["tier"],
+            "party_supplied": p["party"],
+            "stance": stance,
+            "weight": self._weight(p["tier"], stance, p["party"])
+        })
+        c["pending"] = {}
+        self.claims[claim_id] = json.dumps(c, sort_keys=True)
+        return stance
+
+    @gl.public.write
+    def drop_pending_source(self, claim_id: int) -> str:
+        c = json.loads(self.claims[claim_id])
+        c["pending"] = {}
+        self.claims[claim_id] = json.dumps(c, sort_keys=True)
+        return "DROPPED"
 
     @gl.public.write
     def finish_verification(self, claim_id: int) -> str:
-        """Aggregates weighted evidence and commits final verdict."""
         c = json.loads(self.claims[claim_id])
+        sup = 0
+        ref = 0
+        for e in c["evidence"]:
+            if e["stance"] == "SUPPORTS":
+                sup = sup + e["weight"]
+            elif e["stance"] == "REFUTES":
+                ref = ref + e["weight"]
 
-        support_weight = sum(e["weight"] for e in c["evidence"] if e["stance"] == "SUPPORTS")
-        refute_weight = sum(e["weight"] for e in c["evidence"] if e["stance"] == "REFUTES")
-
+        total = sup + ref
         verdict = "INSUFFICIENT_EVIDENCE"
-        confidence = 0
+        conf = 0
 
-        if support_weight >= 8000 and support_weight > (refute_weight * 1.5):
+        if sup >= 4000 and sup > (ref * 1.5):
             verdict = "TRUE"
-            total = support_weight + refute_weight
-            confidence = min(99, int((support_weight / total) * 100)) if total > 0 else 80
-        elif refute_weight >= 8000 and refute_weight > (support_weight * 1.5):
+            conf = int((sup * 100) / total)
+        elif ref >= 4000 and ref > (sup * 1.5):
             verdict = "FALSE"
-            total = support_weight + refute_weight
-            confidence = min(99, int((refute_weight / total) * 100)) if total > 0 else 80
-        elif support_weight > 0 or refute_weight > 0:
+            conf = int((ref * 100) / total)
+        elif total > 0:
             verdict = "DISPUTED"
-            confidence = 50
+            conf = 50
+
+        if conf > 99:
+            conf = 99
 
         c["verdict"] = verdict
-        c["confidence"] = confidence
+        c["confidence"] = conf
         c["status"] = "PROVISIONAL"
-
         self.claims[claim_id] = json.dumps(c, sort_keys=True)
         return verdict
-
-    # ==================== PUBLIC VIEW METHODS ====================
 
     @gl.public.view
     def get_claim(self, claim_id: int) -> str:
         return self.claims[claim_id]
-
-    @gl.public.view
-    def get_all_claims(self) -> list[str]:
-        return list(self.claims)
 
     @gl.public.view
     def total_claims(self) -> int:
